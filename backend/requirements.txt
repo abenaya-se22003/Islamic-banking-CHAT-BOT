@@ -1,0 +1,16 @@
+# =============================================================================
+# Islamic Banking Chatbot — Backend Dependencies
+# =============================================================================
+# Install all at once:  pip install -r requirements.txt
+# =============================================================================
+
+# --- Step 3: Document Preparation ---
+pdfplumber              # PDF text extraction (better than PyPDF2 for tables/layouts)
+
+# --- Coming in later steps ---
+# fastapi               # Web framework (Step 4)
+# uvicorn               # ASGI server for FastAPI (Step 4)
+# langchain             # RAG orchestration (Step 5)
+# google-generativeai   # Gemini API (Step 5)
+# psycopg2-binary       # PostgreSQL driver for Neon (Step 6)
+# pgvector              # pgvector support (Step 6)
