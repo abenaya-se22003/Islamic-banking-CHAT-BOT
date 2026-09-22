@@ -7,10 +7,14 @@
 # --- Step 3: Document Preparation ---
 pdfplumber              # PDF text extraction (better than PyPDF2 for tables/layouts)
 
+# --- Step 5: Chunking + Embedding ---
+sentence-transformers   # Local embedding model (BAAI/bge-large-en-v1.5)
+psycopg2-binary         # PostgreSQL driver for Neon
+pgvector                # pgvector type support for psycopg2
+python-dotenv           # Load .env file for NEON_DATABASE_URL
+
 # --- Coming in later steps ---
-# fastapi               # Web framework (Step 4)
-# uvicorn               # ASGI server for FastAPI (Step 4)
-# langchain             # RAG orchestration (Step 5)
-# google-generativeai   # Gemini API (Step 5)
-# psycopg2-binary       # PostgreSQL driver for Neon (Step 6)
-# pgvector              # pgvector support (Step 6)
+# fastapi               # Web framework
+# uvicorn               # ASGI server for FastAPI
+# langchain             # RAG orchestration
+# google-generativeai   # Gemini API
