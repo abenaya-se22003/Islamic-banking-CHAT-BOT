@@ -153,23 +153,38 @@ def generate_embeddings(model: SentenceTransformer,
 # ---------------------------------------------------------------------------
 def get_db_connection():
     """
-    Creates a psycopg2 connection to the Neon Postgres database using the
-    NEON_DATABASE_URL environment variable and registers the pgvector type.
+    Creates a psycopg2 connection to the Neon Postgres database using
+    NEON_DATABASE_URL or Neon_db environment variable and registers pgvector.
+    Also ensures the pgvector extension and document_chunks table exist.
 
     Returns:
         A psycopg2 connection object with pgvector types registered.
-
-    Raises:
-        SystemExit: If NEON_DATABASE_URL is not set.
     """
-    db_url = os.environ.get("NEON_DATABASE_URL")
+    db_url = os.environ.get("NEON_DATABASE_URL") or os.environ.get("Neon_db") or os.environ.get("NEON_DB")
     if not db_url:
-        print("❌ NEON_DATABASE_URL environment variable is not set.")
-        print("   Set it in backend/.env or export it in your shell:")
-        print('   NEON_DATABASE_URL="postgresql://user:pass@host/db?sslmode=require"')
+        print("❌ Database URL environment variable is not set.")
+        print("   Please set NEON_DATABASE_URL or Neon_db in backend/.env:")
+        print('   Neon_db="postgresql://user:pass@host/db?sslmode=require"')
         sys.exit(1)
 
     conn = psycopg2.connect(db_url)
+    
+    # Ensure pgvector extension and table exist
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id SERIAL PRIMARY KEY,
+                document_name TEXT NOT NULL,
+                module TEXT,
+                chunk_text TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                embedding vector({1024}),
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+    conn.commit()
+
     register_vector(conn)
     return conn
 

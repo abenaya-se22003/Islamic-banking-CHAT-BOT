@@ -13,8 +13,15 @@ psycopg2-binary         # PostgreSQL driver for Neon
 pgvector                # pgvector type support for psycopg2
 python-dotenv           # Load .env file for NEON_DATABASE_URL
 
-# --- Coming in later steps ---
-# fastapi               # Web framework
-# uvicorn               # ASGI server for FastAPI
+# --- Step 7: FastAPI & LLM Chat Endpoint ---
+fastapi                 # Web framework for API endpoints
+uvicorn[standard]       # ASGI web server
+anthropic               # Anthropic Claude Python SDK
+pydantic                # Data validation and request/response schemas
+
+# --- Step 8 & 9: Report Generation & Tool Use ---
+python-docx             # Microsoft Word (.docx) report generation
+
+# --- Optional / Future steps ---
 # langchain             # RAG orchestration
 # google-generativeai   # Gemini API
