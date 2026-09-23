@@ -24,4 +24,4 @@ python-docx             # Microsoft Word (.docx) report generation
 
 # --- Optional / Future steps ---
 # langchain             # RAG orchestration
-# google-generativeai   # Gemini API
+google-genai            # Google Gemini Python SDK
