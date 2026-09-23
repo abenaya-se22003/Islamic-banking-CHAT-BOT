@@ -17,6 +17,13 @@ import os
 import sys
 import pdfplumber
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def read_pdf(path: str) -> str:
     """
@@ -59,54 +66,70 @@ def read_pdf(path: str) -> str:
 
 
 if __name__ == "__main__":
+    import glob
+
     # ---------------------------------------------------------------------------
-    # Path to our test PDF
-    # We use os.path to build the path relative to this script's location,
-    # so it works no matter where you run the script from.
+    # Auto-discover all PDF files in backend/documents/raw/
     # ---------------------------------------------------------------------------
     script_dir = os.path.dirname(os.path.abspath(__file__))
     backend_dir = os.path.dirname(script_dir)  # Go up from scripts/ to backend/
-    pdf_path = os.path.join(backend_dir, "documents", "raw", "dummy_islamic_banking.pdf")
+    raw_docs_dir = os.path.join(backend_dir, "documents", "raw")
+    pdf_files = sorted(glob.glob(os.path.join(raw_docs_dir, "*.pdf")))
 
     print("=" * 50)
     print("🔍 Islamic Banking Chatbot — PDF Reading Test")
     print("=" * 50)
-    print(f"\n📂 Looking for PDF at:\n   {pdf_path}\n")
+    print(f"\n📂 Scanning folder: {raw_docs_dir}")
+    print(f"📄 PDFs found: {len(pdf_files)}\n")
 
-    try:
-        # Extract all text from the PDF
-        extracted_text = read_pdf(pdf_path)
-
-        if not extracted_text.strip():
-            print("⚠️  The PDF was opened but no text could be extracted.")
-            print("   This might mean the PDF contains only images/scanned pages.")
-            print("   You may need OCR (e.g., pytesseract) for such files.")
-        else:
-            # Print the first 500 characters as a preview
-            print("\n📝 First 500 characters of extracted text:")
-            print("-" * 50)
-            print(extracted_text[:500])
-            print("-" * 50)
-
-            # Print stats
-            total_chars = len(extracted_text)
-            total_words = len(extracted_text.split())
-            print(f"\n📊 Stats:")
-            print(f"   Total characters: {total_chars:,}")
-            print(f"   Total words:      {total_words:,}")
-            print(f"\n✅ PDF reading test passed! Ready for the next step.")
-
-    except FileNotFoundError as e:
-        # Clear message if the PDF doesn't exist yet
-        print(f"❌ File not found: {e}")
+    if not pdf_files:
+        print("❌ No PDF files found!")
         print("\n💡 To fix this:")
-        print("   1. Place a PDF file in: backend/documents/raw/")
-        print("   2. Name it: dummy_islamic_banking.pdf")
-        print("   3. Re-run this script")
+        print(f"   1. Place PDF files in: {raw_docs_dir}")
+        print("   2. Re-run this script")
         sys.exit(1)
 
-    except Exception as e:
-        # Catch any other errors (corrupted PDF, permission issues, etc.)
-        print(f"❌ Error reading PDF: {e}")
-        print(f"   Error type: {type(e).__name__}")
-        sys.exit(1)
+    # Test each PDF
+    all_passed = True
+    for pdf_path in pdf_files:
+        pdf_name = os.path.basename(pdf_path)
+        print("-" * 50)
+        print(f"📄 Testing: {pdf_name}")
+
+        try:
+            # Extract all text from the PDF
+            extracted_text = read_pdf(pdf_path)
+
+            if not extracted_text.strip():
+                print("   ⚠️  No text could be extracted (might be scanned/image-based).")
+                all_passed = False
+            else:
+                # Print the first 300 characters as a preview
+                print(f"\n   📝 First 300 characters:")
+                print("   " + "-" * 46)
+                for line in extracted_text[:300].split("\n"):
+                    print(f"   {line}")
+                print("   " + "-" * 46)
+
+                # Print stats
+                total_chars = len(extracted_text)
+                total_words = len(extracted_text.split())
+                print(f"   📊 Characters: {total_chars:,}  |  Words: {total_words:,}")
+                print(f"   ✅ Passed!")
+
+        except FileNotFoundError as e:
+            print(f"   ❌ File not found: {e}")
+            all_passed = False
+
+        except Exception as e:
+            print(f"   ❌ Error reading PDF: {e}")
+            print(f"      Error type: {type(e).__name__}")
+            all_passed = False
+
+    # Summary
+    print("\n" + "=" * 50)
+    if all_passed:
+        print(f"✅ All {len(pdf_files)} PDF(s) read successfully! Ready for the next step.")
+    else:
+        print("⚠️  Some PDFs had issues. Check the output above.")
+    print("=" * 50)
