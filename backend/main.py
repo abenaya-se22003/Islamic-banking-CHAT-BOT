@@ -17,10 +17,23 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
-import anthropic
 from dotenv import load_dotenv
+from google import genai
+from google.genai import errors, types
+
+# Force UTF-8 on Windows console to prevent UnicodeEncodeError with emojis
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI, HTTPException, status
+# pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
+# pyrefly: ignore [missing-import]
 from fastapi.staticfiles import StaticFiles
 from pgvector.psycopg2 import register_vector
 import psycopg2
@@ -42,41 +55,43 @@ if os.path.exists(dotenv_path):
 
 # Embedding model name (matches embed_and_store.py)
 EMBEDDING_MODEL_NAME = "BAAI/bge-large-en-v1.5"
-CLAUDE_MODEL_NAME = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 SYSTEM_PROMPT_FILE = os.path.join(BASE_DIR, "prompts", "system_prompt.txt")
 
 # Global state for loaded model & cached system prompt
 ml_models = {}
 
 # ---------------------------------------------------------------------------
-# Claude Tools / Function Calling Schema
+# Gemini Tools / Function Calling Schema
 # ---------------------------------------------------------------------------
-REPORT_TOOLS = [
-    {
-        "name": "generate_report",
-        "description": (
-            "Generates a downloadable Word report (.docx). Use ONLY when the user "
-            "explicitly asks for a report, downloadable summary, or document export."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "topic": {
-                    "type": "string",
-                    "description": "The title or topic of the report (e.g., 'Murabaha Home Financing Report')."
+REPORT_TOOL = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="generate_report",
+            description=(
+                "Generates a downloadable Word report (.docx). Use ONLY when the user "
+                "explicitly asks for a report, downloadable summary, or document export."
+            ),
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "topic": {
+                        "type": "STRING",
+                        "description": "The title or topic of the report (e.g., 'Murabaha Home Financing Report')."
+                    },
+                    "content_summary": {
+                        "type": "STRING",
+                        "description": (
+                            "Comprehensive Shariah summary, product details, eligibility, "
+                            "and rules based strictly on verified document excerpts."
+                        )
+                    }
                 },
-                "content_summary": {
-                    "type": "string",
-                    "description": (
-                        "Comprehensive Shariah summary, product details, eligibility, "
-                        "and rules based strictly on verified document excerpts."
-                    )
-                }
-            },
-            "required": ["topic", "content_summary"]
-        }
-    }
-]
+                "required": ["topic", "content_summary"]
+            }
+        )
+    ]
+)
 
 
 # ---------------------------------------------------------------------------
@@ -223,17 +238,17 @@ def retrieve_top_chunks(query_embedding: list[float], top_k: int = 5):
         conn.close()
 
 
-def get_claude_client() -> anthropic.Anthropic:
+def get_gemini_client() -> genai.Client:
     """
-    Instantiates Anthropic client using ANTHROPIC_API_KEY or CLAUDE_API env vars.
+    Instantiates Google GenAI client using GEMINI_API_KEY env var.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Anthropic API key not configured. Set ANTHROPIC_API_KEY in backend/.env."
+            detail="Gemini API key not configured. Set GEMINI_API_KEY in backend/.env."
         )
-    return anthropic.Anthropic(api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +263,7 @@ def health_check():
         "status": "online",
         "service": "Islamic Banking Chatbot API",
         "embedding_model": EMBEDDING_MODEL_NAME,
-        "llm_model": CLAUDE_MODEL_NAME,
+        "llm_model": GEMINI_MODEL_NAME,
         "tools_enabled": ["generate_report"],
     }
 
@@ -333,80 +348,93 @@ def chat(request: ChatRequest):
         f"- If the user explicitly asks for a report, call the generate_report tool."
     )
 
-    # 5. Call Claude API with tool definition
-    client = get_claude_client()
+    # 5. Call Gemini API with automatic model fallback for quota limits
+    client = get_gemini_client()
+    models_to_try = [GEMINI_MODEL_NAME, "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
+    seen = set()
+    models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
+
+    last_error = None
+    response = None
+    used_model = GEMINI_MODEL_NAME
+
+    for candidate_model in models_to_try:
+        try:
+            config = types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=[REPORT_TOOL],
+                temperature=0.3,
+            )
+            response = client.models.generate_content(
+                model=candidate_model,
+                contents=user_prompt_content,
+                config=config,
+            )
+            used_model = candidate_model
+            break
+        except Exception as exc:
+            last_error = exc
+            print(f"⚠️ Model {candidate_model} returned error: {exc}. Trying fallback model...")
+            continue
+
+    if response is None:
+        if last_error:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Gemini API rate limit or error reached on models: {str(last_error)}"
+            )
+        raise HTTPException(status_code=500, detail="Failed to get response from Gemini.")
+
     try:
-        messages = [
-            {"role": "user", "content": user_prompt_content}
-        ]
 
-        response = client.messages.create(
-            model=CLAUDE_MODEL_NAME,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=messages,
-            tools=REPORT_TOOLS,
-        )
-
-        # 6. Check for tool_use blocks in Claude's response
+        # 6. Check for function calls in Gemini's response
         report_url = None
-        tool_use_block = None
+        answer_text = ""
 
-        for block in response.content:
-            if block.type == "tool_use" and block.name == "generate_report":
-                tool_use_block = block
-                break
+        if response.function_calls:
+            for call in response.function_calls:
+                if call.name == "generate_report":
+                    args = call.args or {}
+                    topic = args.get("topic", "Islamic Banking Report")
+                    content_summary = args.get("content_summary", "")
 
-        # Handle tool execution
-        if tool_use_block:
-            tool_input = tool_use_block.input or {}
-            topic = tool_input.get("topic", "Islamic Banking Report")
-            content_summary = tool_input.get("content_summary", "")
+                    # Execute Python function locally
+                    tool_result = generate_report(topic=topic, content_summary=content_summary)
 
-            # Execute Python function locally
-            tool_result = generate_report(topic=topic, content_summary=content_summary)
+                    if tool_result.get("status") == "success":
+                        report_url = tool_result.get("download_url")
 
-            if tool_result.get("status") == "success":
-                report_url = tool_result.get("download_url")
+                    # Send tool result back to Gemini to formulate final response
+                    follow_up_contents = [
+                        user_prompt_content,
+                        response.candidates[0].content,
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_function_response(
+                                    name="generate_report",
+                                    response=tool_result,
+                                )
+                            ],
+                        ),
+                    ]
 
-            # Send tool result back to Claude to formulate final response
-            follow_up_messages = [
-                {"role": "user", "content": user_prompt_content},
-                {"role": "assistant", "content": response.content},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_block.id,
-                            "content": json.dumps(tool_result),
-                        }
-                    ],
-                },
-            ]
-
-            follow_up_response = client.messages.create(
-                model=CLAUDE_MODEL_NAME,
-                max_tokens=1024,
-                system=system_prompt,
-                messages=follow_up_messages,
-                tools=REPORT_TOOLS,
-            )
-
-            # Extract final text from follow-up response
-            answer_text = "".join(
-                block.text for block in follow_up_response.content if hasattr(block, "text")
-            )
-
+                    follow_up_response = client.models.generate_content(
+                        model=GEMINI_MODEL_NAME,
+                        contents=follow_up_contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            temperature=0.3,
+                        ),
+                    )
+                    answer_text = follow_up_response.text or ""
+                    break
         else:
-            # Standard response without tool execution
-            answer_text = "".join(
-                block.text for block in response.content if hasattr(block, "text")
-            )
+            answer_text = response.text or ""
 
         if not answer_text.strip():
             if report_url:
-                answer_text = f"Your report has been generated successfully. You can download it using the link provided."
+                answer_text = "Your report has been generated successfully. You can download it using the link provided."
             else:
                 answer_text = "I don't have enough information in our documents to answer this. Please contact a bank representative or Shariah advisor."
 
@@ -416,22 +444,14 @@ def chat(request: ChatRequest):
             report_url=report_url
         )
 
-    except anthropic.APIConnectionError as exc:
+    except errors.APIError as exc:
+        print(f"❌ Gemini API Error ({exc.code}): {exc.message}")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Unable to connect to Claude API: {str(exc)}"
-        )
-    except anthropic.RateLimitError:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Claude API rate limit reached. Please try again in a moment."
-        )
-    except anthropic.APIStatusError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Claude API returned error ({exc.status_code}): {exc.message}"
+            detail=f"Gemini API returned error ({exc.code}): {exc.message}"
         )
     except Exception as exc:
+        print(f"❌ Unexpected error in /chat: {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error generating answer: {str(exc)}"
