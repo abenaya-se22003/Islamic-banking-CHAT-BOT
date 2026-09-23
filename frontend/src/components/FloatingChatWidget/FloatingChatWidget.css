@@ -1,0 +1,284 @@
+/* ============================================================
+   FloatingChatWidget.css  —  Floating bubble + chat window
+   Overlays on any page. Professional, bank-appropriate.
+   ============================================================ */
+
+/* ---------- Floating Wrapper ---------- */
+.fcw-wrapper {
+  position: fixed;
+  bottom: 28px;
+  right: 28px;
+  z-index: 99999;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+/* ---------- Floating Trigger Button ---------- */
+.fcw-trigger {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 22px 0 18px;
+  height: 52px;
+  border: none;
+  border-radius: 26px;
+  background: linear-gradient(135deg, #0e7c6b 0%, #0a9b85 100%);
+  color: #ffffff;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  box-shadow:
+    0 4px 20px rgba(14, 124, 107, 0.35),
+    0 2px 8px rgba(0, 0, 0, 0.10);
+  transition: transform 0.2s ease, box-shadow 0.25s ease;
+  white-space: nowrap;
+}
+
+.fcw-trigger:hover {
+  transform: translateY(-2px) scale(1.03);
+  box-shadow:
+    0 6px 28px rgba(14, 124, 107, 0.45),
+    0 3px 12px rgba(0, 0, 0, 0.12);
+}
+
+.fcw-trigger:active {
+  transform: translateY(0) scale(0.98);
+}
+
+.fcw-trigger-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+}
+
+.fcw-trigger-icon svg {
+  width: 22px;
+  height: 22px;
+}
+
+/* Subtle pulsing ring behind the trigger when closed */
+.fcw-trigger::before {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 30px;
+  background: rgba(14, 124, 107, 0.15);
+  animation: fcwPulse 2.5s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes fcwPulse {
+  0%, 100% { transform: scale(1);   opacity: 0.6; }
+  50%      { transform: scale(1.06); opacity: 0;   }
+}
+
+/* ---------- Chat Window ---------- */
+.fcw-window {
+  position: absolute;
+  bottom: 68px;
+  right: 0;
+  width: 370px;
+  height: 520px;
+  max-height: calc(100vh - 100px);
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  background: #ffffff;
+  box-shadow:
+    0 12px 48px rgba(0, 0, 0, 0.16),
+    0 4px 16px rgba(0, 0, 0, 0.08);
+  border: 1px solid #e2e8f0;
+  overflow: hidden;
+
+  /* Animation */
+  transform-origin: bottom right;
+  animation: fcwSlideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes fcwSlideUp {
+  from {
+    opacity: 0;
+    transform: translateY(16px) scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Close animation — applied via JS class */
+.fcw-window.fcw-closing {
+  animation: fcwSlideDown 0.22s cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+
+@keyframes fcwSlideDown {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(12px) scale(0.94);
+  }
+}
+
+/* ---------- Chat Window Header ---------- */
+.fcw-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  background: linear-gradient(135deg, #0e7c6b 0%, #0a9b85 100%);
+  color: #ffffff;
+  flex-shrink: 0;
+}
+
+.fcw-header-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.18);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.fcw-header-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.fcw-header-title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.fcw-header-status {
+  font-size: 11px;
+  opacity: 0.8;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.fcw-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #4ade80;
+  flex-shrink: 0;
+}
+
+.fcw-close-btn {
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.15);
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s ease;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.fcw-close-btn:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.fcw-close-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* ---------- Embedded ChatWidget overrides ---------- */
+/* Override the ChatWidget's own container sizing when nested inside
+   the floating window, so it fills the window without double borders */
+.fcw-window .cw-container {
+  width: 100%;
+  height: 100%;
+  max-height: none;
+  border-radius: 0;
+  box-shadow: none;
+  border: none;
+}
+
+/* Hide the ChatWidget's built-in header since we use our own */
+.fcw-window .cw-header {
+  display: none;
+}
+
+/* ---------- Unread Badge ---------- */
+.fcw-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 20px;
+  height: 20px;
+  border-radius: 10px;
+  background: #ef4444;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 5px;
+  box-shadow: 0 2px 6px rgba(239, 68, 68, 0.4);
+  animation: fcwBadgePop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+@keyframes fcwBadgePop {
+  from { transform: scale(0); }
+  to   { transform: scale(1); }
+}
+
+/* ---------- Responsive: Mobile ---------- */
+@media (max-width: 480px) {
+  .fcw-wrapper {
+    bottom: 16px;
+    right: 16px;
+  }
+
+  .fcw-trigger {
+    /* Compact: icon-only on very small screens */
+    padding: 0;
+    width: 52px;
+    justify-content: center;
+  }
+
+  .fcw-trigger-label {
+    display: none;
+  }
+
+  .fcw-window {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: 100%;
+    max-height: 100vh;
+    border-radius: 0;
+    transform-origin: bottom center;
+  }
+}
+
+@media (min-width: 481px) and (max-width: 640px) {
+  .fcw-window {
+    width: calc(100vw - 32px);
+    right: -12px;
+  }
+}
