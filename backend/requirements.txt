@@ -22,6 +22,12 @@ pydantic                # Data validation and request/response schemas
 # --- Step 8 & 9: Report Generation & Tool Use ---
 python-docx             # Microsoft Word (.docx) report generation
 
+# --- Web & URL Reader Agent ---
+beautifulsoup4          # HTML parsing and clean text extraction
+httpx                   # Fast HTTP client for fetching URLs
+trafilatura             # Main article text extraction from web pages
+
 # --- Optional / Future steps ---
 # langchain             # RAG orchestration
 google-genai            # Google Gemini Python SDK
+
