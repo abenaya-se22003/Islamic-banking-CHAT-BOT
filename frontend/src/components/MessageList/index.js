@@ -80,6 +80,9 @@ const TypingBubble = styled.div`
 export default function MessageList({ messages, isLoading }) {
   const bottomRef = useRef(null);
 
+  // Check if there's a streaming message already showing text
+  const hasStreamingMessage = messages.some((msg) => msg.isStreaming && msg.text);
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isLoading]);
@@ -90,7 +93,8 @@ export default function MessageList({ messages, isLoading }) {
         <MessageItem key={msg.id || index} message={msg} />
       ))}
 
-      {isLoading && (
+      {/* Only show typing dots when loading but no streamed text is visible yet */}
+      {isLoading && !hasStreamingMessage && (
         <TypingIndicatorContainer>
           <Avatar>AL</Avatar>
           <TypingBubble>

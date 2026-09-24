@@ -169,61 +169,164 @@ export default function Welcome() {
 
     setIsLoading(true);
 
+    // Create a placeholder bot message that will be updated with streaming tokens
+    const botMessageId = 'msg_bot_' + Date.now();
+    const botMessage = {
+      id: botMessageId,
+      sender: 'assistant',
+      text: '',
+      sources: [],
+      reportUrl: null,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      isStreaming: true,
+    };
+
+    // Add empty bot message immediately (will be filled by stream)
+    setSessions((prev) =>
+      prev.map((s) => {
+        if (s.id === targetSessionId) {
+          return {
+            ...s,
+            updatedAt: new Date().toISOString(),
+            messages: [...s.messages, botMessage],
+          };
+        }
+        return s;
+      })
+    );
+
     try {
-      const response = await axios.post(
-        API_ENDPOINT,
-        { question: text.trim() },
-        { timeout: 90000 }
-      );
+      const STREAM_ENDPOINT = 'http://localhost:8000/chat/stream';
+      const response = await fetch(STREAM_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: text.trim() }),
+      });
 
-      const data = response.data;
-      const botMessage = {
-        id: 'msg_bot_' + Date.now(),
-        sender: 'assistant',
-        text: data.answer || 'No response generated.',
-        sources: data.sources || [],
-        reportUrl: data.report_url || null,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      };
+      if (!response.ok) {
+        throw new Error(`Server error: ${response.status}`);
+      }
 
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let accumulatedText = '';
+      let streamSources = [];
+      let streamReportUrl = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events from buffer
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+        let eventType = '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            const rawData = line.slice(6);
+            try {
+              const data = JSON.parse(rawData);
+
+              if (eventType === 'token' && data.text) {
+                accumulatedText += data.text;
+                // Update the bot message in real-time
+                setSessions((prev) =>
+                  prev.map((s) => {
+                    if (s.id === targetSessionId) {
+                      return {
+                        ...s,
+                        messages: s.messages.map((m) =>
+                          m.id === botMessageId
+                            ? { ...m, text: accumulatedText }
+                            : m
+                        ),
+                      };
+                    }
+                    return s;
+                  })
+                );
+              } else if (eventType === 'sources' && data.sources) {
+                streamSources = data.sources;
+              } else if (eventType === 'report' && data.url) {
+                streamReportUrl = data.url;
+              } else if (eventType === 'error' && data.error) {
+                accumulatedText += `\n\n⚠️ Error: ${data.error}`;
+              }
+            } catch {
+              // Ignore JSON parse errors for incomplete data
+            }
+            eventType = '';
+          }
+        }
+      }
+
+      // Finalize the bot message (remove streaming flag, add sources)
       setSessions((prev) =>
         prev.map((s) => {
           if (s.id === targetSessionId) {
             return {
               ...s,
               updatedAt: new Date().toISOString(),
-              messages: [...s.messages, botMessage],
+              messages: s.messages.map((m) =>
+                m.id === botMessageId
+                  ? {
+                      ...m,
+                      text: accumulatedText || 'No response generated.',
+                      sources: streamSources,
+                      reportUrl: streamReportUrl,
+                      isStreaming: false,
+                    }
+                  : m
+              ),
             };
           }
           return s;
         })
       );
     } catch (err) {
-      console.error('Chat API Error:', err);
+      console.error('Chat Stream Error:', err);
       let errorText =
         '⚠️ An error occurred while communicating with the Al-Falaah assistant. Please verify the backend server is running.';
 
-      if (err.response && err.response.data && err.response.data.detail) {
-        errorText = `⚠️ Error: ${err.response.data.detail}`;
-      } else if (err.code === 'ECONNABORTED') {
-        errorText = '⏱️ Request timed out. Please try again.';
+      if (err.message && err.message.includes('Server error')) {
+        errorText = `⚠️ ${err.message}`;
       }
 
-      const errorMessage = {
-        id: 'msg_err_' + Date.now(),
-        sender: 'assistant',
-        text: errorText,
-        sources: [],
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      };
-
+      // Update the bot message with error, or add a new error message
       setSessions((prev) =>
         prev.map((s) => {
           if (s.id === targetSessionId) {
-            return {
-              ...s,
-              messages: [...s.messages, errorMessage],
-            };
+            const hasBotMsg = s.messages.some((m) => m.id === botMessageId);
+            if (hasBotMsg) {
+              return {
+                ...s,
+                messages: s.messages.map((m) =>
+                  m.id === botMessageId
+                    ? { ...m, text: errorText, isStreaming: false }
+                    : m
+                ),
+              };
+            } else {
+              return {
+                ...s,
+                messages: [
+                  ...s.messages,
+                  {
+                    id: 'msg_err_' + Date.now(),
+                    sender: 'assistant',
+                    text: errorText,
+                    sources: [],
+                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                  },
+                ],
+              };
+            }
           }
           return s;
         })

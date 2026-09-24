@@ -11,11 +11,14 @@ Features:
 - Full CORS support for React frontend (localhost:3000, 5173)
 """
 
+import asyncio
 import json
 import os
 import sys
+import hashlib
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Optional
+from functools import lru_cache
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from google import genai
@@ -34,11 +37,21 @@ from fastapi import FastAPI, HTTPException, status
 # pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
 # pyrefly: ignore [missing-import]
+from fastapi.responses import StreamingResponse
+# pyrefly: ignore [missing-import]
 from fastapi.staticfiles import StaticFiles
 from pgvector.psycopg2 import register_vector
 import psycopg2
+from psycopg2 import pool
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
+
+# Optional Redis cache — falls back to LRU if Redis is not available
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
 
 from tools.report_tool import generate_report, REPORTS_DIR
 
@@ -53,13 +66,23 @@ dotenv_path = os.path.join(BASE_DIR, ".env")
 if os.path.exists(dotenv_path):
     load_dotenv(dotenv_path)
 
-# Embedding model name (matches embed_and_store.py)
-EMBEDDING_MODEL_NAME = "BAAI/bge-large-en-v1.5"
+# Embedding model name — configurable via .env (default: bge-large for accuracy)
+# Set EMBEDDING_MODEL=BAAI/bge-small-en-v1.5 in .env for faster (slightly less accurate) embeddings
+EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
 GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 SYSTEM_PROMPT_FILE = os.path.join(BASE_DIR, "prompts", "system_prompt.txt")
 
+# Redis config (optional — set REDIS_URL in .env to enable)
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+EMBEDDING_CACHE_TTL = int(os.environ.get("EMBEDDING_CACHE_TTL", "3600"))  # 1 hour default
+
 # Global state for loaded model & cached system prompt
 ml_models = {}
+
+# Connection pool & cached clients (initialized in lifespan)
+db_pool = None
+gemini_client_cache = None
+redis_client = None
 
 # ---------------------------------------------------------------------------
 # Gemini Tools / Function Calling Schema
@@ -99,6 +122,8 @@ REPORT_TOOL = types.Tool(
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global db_pool, gemini_client_cache, redis_client
+
     print(f"🤖 Initializing embedding model: {EMBEDDING_MODEL_NAME}...")
     try:
         # Load embedding model into memory on server startup
@@ -107,6 +132,39 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         print(f"❌ Failed to load embedding model: {exc}")
         ml_models["embedding_model"] = None
+
+    # Initialize DB connection pool (min 2, max 10 connections)
+    try:
+        db_url = os.environ.get("NEON_DATABASE_URL") or os.environ.get("Neon_db") or os.environ.get("NEON_DB")
+        if db_url:
+            db_pool = pool.ThreadedConnectionPool(2, 10, db_url)
+            print("✅ Database connection pool initialized (2-10 connections).")
+        else:
+            print("⚠️ No database URL found. Pool not initialized.")
+    except Exception as exc:
+        print(f"❌ Failed to initialize DB pool: {exc}")
+        db_pool = None
+
+    # Pre-initialize Gemini client once
+    try:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if api_key:
+            gemini_client_cache = genai.Client(api_key=api_key)
+            print("✅ Gemini client initialized.")
+    except Exception as exc:
+        print(f"⚠️ Failed to pre-initialize Gemini client: {exc}")
+
+    # Initialize Redis cache (optional — graceful fallback to LRU)
+    if REDIS_AVAILABLE:
+        try:
+            redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+            redis_client.ping()
+            print("✅ Redis cache connected.")
+        except Exception as exc:
+            print(f"⚠️ Redis not available ({exc}). Using in-memory LRU cache instead.")
+            redis_client = None
+    else:
+        print("ℹ️ Redis package not installed. Using in-memory LRU cache. (pip install redis to enable)")
 
     # Load system prompt template
     if os.path.exists(SYSTEM_PROMPT_FILE):
@@ -126,6 +184,14 @@ async def lifespan(app: FastAPI):
     yield
     # Cleanup on shutdown
     ml_models.clear()
+    if db_pool:
+        db_pool.closeall()
+        print("✅ Database connection pool closed.")
+    if redis_client:
+        try:
+            redis_client.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -191,15 +257,24 @@ class ChatResponse(BaseModel):
 # ---------------------------------------------------------------------------
 def get_db_connection():
     """
-    Connects to Neon Postgres using NEON_DATABASE_URL or Neon_db.
+    Gets a connection from the pool, or creates a direct connection as fallback.
     """
+    global db_pool
+    if db_pool:
+        try:
+            conn = db_pool.getconn()
+            register_vector(conn)
+            return conn
+        except Exception as exc:
+            print(f"⚠️ Pool connection failed, falling back to direct: {exc}")
+
+    # Fallback: direct connection
     db_url = os.environ.get("NEON_DATABASE_URL") or os.environ.get("Neon_db") or os.environ.get("NEON_DB")
     if not db_url:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Database connection string not configured. Set NEON_DATABASE_URL in backend/.env."
         )
-
     try:
         conn = psycopg2.connect(db_url)
         register_vector(conn)
@@ -209,6 +284,22 @@ def get_db_connection():
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Failed to connect to database: {str(exc)}"
         )
+
+
+def return_db_connection(conn):
+    """Returns a connection back to the pool."""
+    global db_pool
+    if db_pool:
+        try:
+            db_pool.putconn(conn)
+            return
+        except Exception:
+            pass
+    # If not pooled, just close it
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 
 def retrieve_top_chunks(query_embedding: list[float], top_k: int = 5):
@@ -235,20 +326,67 @@ def retrieve_top_chunks(query_embedding: list[float], top_k: int = 5):
             detail=f"Vector search query failed: {str(exc)}"
         )
     finally:
-        conn.close()
+        return_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# Embedding cache: Redis first, LRU fallback
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=256)
+def _lru_cached_embedding(question_hash: str, question: str):
+    """In-memory LRU fallback cache."""
+    model: SentenceTransformer = ml_models.get("embedding_model")
+    if model is None:
+        return None
+    query_text = f"Represent this sentence: {question}"
+    return model.encode(query_text, normalize_embeddings=True).tolist()
+
+
+def get_cached_embedding(question_hash: str, question: str):
+    """
+    Tries Redis cache first (if available), then falls back to LRU cache.
+    This ensures the system works with or without Redis installed.
+    """
+    # Try Redis first
+    if redis_client:
+        try:
+            cache_key = f"emb:{question_hash}"
+            cached = redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass  # Redis read failed, fall through
+
+    # Compute embedding (via LRU cache)
+    embedding = _lru_cached_embedding(question_hash, question)
+
+    # Store in Redis for cross-process sharing
+    if redis_client and embedding:
+        try:
+            cache_key = f"emb:{question_hash}"
+            redis_client.setex(cache_key, EMBEDDING_CACHE_TTL, json.dumps(embedding))
+        except Exception:
+            pass  # Redis write failed, that's okay
+
+    return embedding
 
 
 def get_gemini_client() -> genai.Client:
     """
-    Instantiates Google GenAI client using GEMINI_API_KEY env var.
+    Returns cached Gemini client or creates one if needed.
     """
+    global gemini_client_cache
+    if gemini_client_cache:
+        return gemini_client_cache
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Gemini API key not configured. Set GEMINI_API_KEY in backend/.env."
         )
-    return genai.Client(api_key=api_key)
+    gemini_client_cache = genai.Client(api_key=api_key)
+    return gemini_client_cache
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +407,7 @@ def health_check():
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
-def chat(request: ChatRequest):
+async def chat(request: ChatRequest):
     """
     Search + Answer with Agent Tool Calling Endpoint:
     1. Embeds question using BAAI/bge-large-en-v1.5
@@ -289,18 +427,18 @@ def chat(request: ChatRequest):
             detail="Question cannot be empty."
         )
 
-    # 1. Generate query embedding
-    model: Optional[SentenceTransformer] = ml_models.get("embedding_model")
-    if model is None:
+    # 1. Generate query embedding (with caching for repeated questions)
+    if ml_models.get("embedding_model") is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Embedding model is not ready. Please check server logs."
         )
 
     try:
-        # BGE recommendation: prefix query with "Represent this sentence: " for retrieval
-        query_text = f"Represent this sentence: {user_question}"
-        query_embedding = model.encode(query_text, normalize_embeddings=True).tolist()
+        question_hash = hashlib.md5(user_question.encode()).hexdigest()
+        query_embedding = get_cached_embedding(question_hash, user_question)
+        if query_embedding is None:
+            raise RuntimeError("Embedding model became unavailable")
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -420,7 +558,7 @@ def chat(request: ChatRequest):
                     ]
 
                     follow_up_response = client.models.generate_content(
-                        model=GEMINI_MODEL_NAME,
+                        model=used_model,  # Use the model that worked, not default
                         contents=follow_up_contents,
                         config=types.GenerateContentConfig(
                             system_instruction=system_prompt,
@@ -456,6 +594,193 @@ def chat(request: ChatRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error generating answer: {str(exc)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Streaming SSE Endpoint: /chat/stream
+# ---------------------------------------------------------------------------
+# Sends response tokens as Server-Sent Events for real-time display.
+# Frontend receives text chunk-by-chunk instead of waiting for full response.
+# Falls back gracefully — if streaming fails, sends complete response as one event.
+# ---------------------------------------------------------------------------
+@app.post("/chat/stream", tags=["Chat"])
+async def chat_stream(request: ChatRequest):
+    """
+    Streaming version of /chat using Server-Sent Events (SSE).
+    Streams Gemini response tokens in real-time for instant user feedback.
+    
+    SSE Event format:
+    - event: token   → partial text chunk
+    - event: sources → JSON array of source document names
+    - event: report  → report download URL (if generated)
+    - event: done    → signals stream completion
+    - event: error   → error message
+    """
+    user_question = request.question.strip()
+    if not user_question:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Question cannot be empty."
+        )
+
+    # 1. Generate query embedding
+    if ml_models.get("embedding_model") is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Embedding model is not ready."
+        )
+
+    try:
+        question_hash = hashlib.md5(user_question.encode()).hexdigest()
+        query_embedding = get_cached_embedding(question_hash, user_question)
+        if query_embedding is None:
+            raise RuntimeError("Embedding model unavailable")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # 2. Retrieve chunks
+    chunks = retrieve_top_chunks(query_embedding, top_k=5)
+    if not chunks:
+        async def no_data_stream():
+            msg = "I don't have enough information in our documents to answer this. Please contact a bank representative or Shariah advisor."
+            yield f"event: token\ndata: {json.dumps({'text': msg})}\n\n"
+            yield f"event: done\ndata: {json.dumps({'sources': []})}\n\n"
+        return StreamingResponse(no_data_stream(), media_type="text/event-stream")
+
+    # Build context
+    context_blocks = []
+    sources = []
+    for doc_name, chunk_idx, chunk_text, _sim in chunks:
+        context_blocks.append(
+            f"--- Document: {doc_name} (Chunk #{chunk_idx}) ---\n{chunk_text.strip()}"
+        )
+        if doc_name not in sources:
+            sources.append(doc_name)
+
+    context_str = "\n\n".join(context_blocks)
+    system_prompt = ml_models.get("system_prompt", "You are the Islamic Banking Assistant.")
+
+    user_prompt_content = (
+        f"DOCUMENT EXCERPTS:\n"
+        f"==================\n"
+        f"{context_str}\n\n"
+        f"==================\n"
+        f"USER REQUEST:\n"
+        f"{user_question}\n\n"
+        f"Instructions:\n"
+        f"- Answer accurately and strictly based on the excerpts provided.\n"
+        f"- If the user explicitly asks for a report, call the generate_report tool."
+    )
+
+    async def event_stream():
+        """Generator that yields SSE events with streamed Gemini response."""
+        client = get_gemini_client()
+        models_to_try = [GEMINI_MODEL_NAME, "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
+        seen = set()
+        models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
+
+        report_url = None
+        streamed_any = False
+        last_error = None
+
+        for candidate_model in models_to_try:
+            try:
+                config = types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    tools=[REPORT_TOOL],
+                    temperature=0.3,
+                )
+
+                # Use streaming generation
+                stream_response = client.models.generate_content_stream(
+                    model=candidate_model,
+                    contents=user_prompt_content,
+                    config=config,
+                )
+
+                # Check if it's a function call (report generation)
+                full_text = ""
+                function_call_detected = False
+
+                for chunk in stream_response:
+                    # Check for function calls
+                    if chunk.function_calls:
+                        function_call_detected = True
+                        for call in chunk.function_calls:
+                            if call.name == "generate_report":
+                                args = call.args or {}
+                                topic = args.get("topic", "Islamic Banking Report")
+                                content_summary = args.get("content_summary", "")
+                                tool_result = generate_report(topic=topic, content_summary=content_summary)
+
+                                if tool_result.get("status") == "success":
+                                    report_url = tool_result.get("download_url")
+                                    yield f"event: report\ndata: {json.dumps({'url': report_url})}\n\n"
+
+                                # Get follow-up response (non-streaming for tool results)
+                                try:
+                                    follow_up_contents = [
+                                        user_prompt_content,
+                                        chunk.candidates[0].content,
+                                        types.Content(
+                                            role="user",
+                                            parts=[
+                                                types.Part.from_function_response(
+                                                    name="generate_report",
+                                                    response=tool_result,
+                                                )
+                                            ],
+                                        ),
+                                    ]
+                                    follow_up = client.models.generate_content(
+                                        model=candidate_model,
+                                        contents=follow_up_contents,
+                                        config=types.GenerateContentConfig(
+                                            system_instruction=system_prompt,
+                                            temperature=0.3,
+                                        ),
+                                    )
+                                    if follow_up.text:
+                                        yield f"event: token\ndata: {json.dumps({'text': follow_up.text})}\n\n"
+                                        streamed_any = True
+                                except Exception as fu_exc:
+                                    yield f"event: token\ndata: {json.dumps({'text': 'Your report has been generated successfully.'})}\n\n"
+                                    streamed_any = True
+                        break
+
+                    # Stream text tokens
+                    if chunk.text:
+                        yield f"event: token\ndata: {json.dumps({'text': chunk.text})}\n\n"
+                        full_text += chunk.text
+                        streamed_any = True
+                        await asyncio.sleep(0)  # Yield control for responsiveness
+
+                break  # Success, stop trying models
+
+            except Exception as exc:
+                last_error = exc
+                print(f"⚠️ Stream: Model {candidate_model} failed: {exc}")
+                continue
+
+        if not streamed_any:
+            if last_error:
+                yield f"event: error\ndata: {json.dumps({'error': str(last_error)})}\n\n"
+            else:
+                yield f"event: token\ndata: {json.dumps({'text': 'No response generated.'})}\n\n"
+
+        # Send sources and completion signal
+        yield f"event: sources\ndata: {json.dumps({'sources': sources})}\n\n"
+        yield f"event: done\ndata: {json.dumps({'report_url': report_url})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
 
 
 if __name__ == "__main__":

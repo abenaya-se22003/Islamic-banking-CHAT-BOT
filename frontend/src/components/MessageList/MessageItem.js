@@ -22,6 +22,11 @@ const fadeIn = keyframes`
   }
 `;
 
+const blink = keyframes`
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+`;
+
 const MessageRow = styled.div`
   display: flex;
   gap: 16px;
@@ -192,6 +197,16 @@ const MessageBubble = styled.div`
   }
 `;
 
+const StreamingCursor = styled.span`
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: ${({ theme }) => theme.accentGold};
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: ${blink} 0.8s step-end infinite;
+`;
+
 const ReportCard = styled.div`
   display: flex;
   align-items: center;
@@ -360,9 +375,12 @@ export default function MessageItem({ message }) {
           {isUser ? (
             message.text
           ) : (
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>
-              {message.text}
-            </ReactMarkdown>
+            <>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {message.text}
+              </ReactMarkdown>
+              {message.isStreaming && <StreamingCursor />}
+            </>
           )}
 
           {/* Generated Document Report Download Card */}
