@@ -79,7 +79,7 @@ def main():
     try:
         results = search_similar_chunks(query, top_k=3)
         if not results:
-            print("⚠️ No matching chunks found. Did you run scripts/embed_and_store.py first?")
+            print("⚠️ No matching chunks found. Did you run scripts/fast_ingest.py first?")
             return
 
         print(f"📚 Retrieved Top {len(results)} Chunks:\n")
