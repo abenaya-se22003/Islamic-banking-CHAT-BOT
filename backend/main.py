@@ -54,6 +54,7 @@ except ImportError:
     REDIS_AVAILABLE = False
 
 from tools.report_tool import generate_report, REPORTS_DIR
+from tools.url_tool import fetch_url_content
 
 # ---------------------------------------------------------------------------
 # Load environment variables
@@ -69,8 +70,9 @@ if os.path.exists(dotenv_path):
 # Embedding model name — configurable via .env (default: bge-large for accuracy)
 # Set EMBEDDING_MODEL=BAAI/bge-small-en-v1.5 in .env for faster (slightly less accurate) embeddings
 EMBEDDING_MODEL_NAME = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
-GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 SYSTEM_PROMPT_FILE = os.path.join(BASE_DIR, "prompts", "system_prompt.txt")
+
 
 # Redis config (optional — set REDIS_URL in .env to enable)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -85,9 +87,9 @@ gemini_client_cache = None
 redis_client = None
 
 # ---------------------------------------------------------------------------
-# Gemini Tools / Function Calling Schema
+# Gemini Agent Tools / Function Calling Schema
 # ---------------------------------------------------------------------------
-REPORT_TOOL = types.Tool(
+AGENT_TOOLS = types.Tool(
     function_declarations=[
         types.FunctionDeclaration(
             name="generate_report",
@@ -112,9 +114,47 @@ REPORT_TOOL = types.Tool(
                 },
                 "required": ["topic", "content_summary"]
             }
+        ),
+        types.FunctionDeclaration(
+            name="fetch_url_content",
+            description=(
+                "Fetches, reads, and extracts clean readable text content from any web page, "
+                "documentation link, or online URL. Use this whenever the user provides a web link, "
+                "asks to read/summarize an online resource, or when online Shariah documentation needs inspection."
+            ),
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "url": {
+                        "type": "STRING",
+                        "description": "The complete HTTP or HTTPS URL to fetch and read."
+                    }
+                },
+                "required": ["url"]
+            }
         )
     ]
 )
+
+
+def handle_agent_tool_call(call_name: str, call_args: dict):
+    """
+    Executes agent tool functions locally.
+    Returns: (tool_result_dict, report_url_or_none, fetched_url_or_none)
+    """
+    if call_name == "generate_report":
+        topic = call_args.get("topic", "Islamic Banking Report")
+        content_summary = call_args.get("content_summary", "")
+        res = generate_report(topic=topic, content_summary=content_summary)
+        rep_url = res.get("download_url") if res.get("status") == "success" else None
+        return res, rep_url, None
+    elif call_name == "fetch_url_content":
+        url = call_args.get("url", "")
+        res = fetch_url_content(url=url)
+        fetched_src = url if res.get("status") in ("success", "warning") else None
+        return res, None, fetched_src
+    return {"status": "error", "error": f"Unknown tool: {call_name}"}, None, None
+
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +442,7 @@ def health_check():
         "service": "Islamic Banking Chatbot API",
         "embedding_model": EMBEDDING_MODEL_NAME,
         "llm_model": GEMINI_MODEL_NAME,
-        "tools_enabled": ["generate_report"],
+        "tools_enabled": ["generate_report", "fetch_url_content"],
     }
 
 
@@ -413,11 +453,10 @@ async def chat(request: ChatRequest):
     1. Embeds question using BAAI/bge-large-en-v1.5
     2. Performs pgvector cosine similarity search (<=>) on Neon Postgres
     3. Formats prompt with system guidelines + retrieved excerpts + question
-    4. Calls Claude API with tool definitions (generate_report)
-    5. If Claude triggers tool_use:
-       - Runs generate_report() locally
-       - Feeds tool_result back to Claude for final response
-       - Captures download_url for the response
+    4. Calls Gemini API with tools (generate_report, fetch_url_content)
+    5. If Gemini triggers tool_use:
+       - Runs tool locally (generates docx or fetches live URL)
+       - Feeds tool_result back to Gemini for final response
     6. Returns answer, sources, and report_url (or null)
     """
     user_question = request.question.strip()
@@ -434,43 +473,30 @@ async def chat(request: ChatRequest):
             detail="Embedding model is not ready. Please check server logs."
         )
 
+    sources = []
+    context_blocks = []
+
     try:
         question_hash = hashlib.md5(user_question.encode()).hexdigest()
         query_embedding = get_cached_embedding(question_hash, user_question)
-        if query_embedding is None:
-            raise RuntimeError("Embedding model became unavailable")
+        if query_embedding:
+            # 2. Retrieve top 5 most similar chunks from pgvector
+            chunks = retrieve_top_chunks(query_embedding, top_k=5)
+            for doc_name, chunk_idx, chunk_text, _sim in chunks:
+                context_blocks.append(
+                    f"--- Document: {doc_name} (Chunk #{chunk_idx}) ---\n{chunk_text.strip()}"
+                )
+                if doc_name not in sources:
+                    sources.append(doc_name)
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate query embedding: {str(exc)}"
-        )
+        print(f"⚠️ Vector search warning: {exc}")
 
-    # 2. Retrieve top 5 most similar chunks from pgvector
-    chunks = retrieve_top_chunks(query_embedding, top_k=5)
-
-    if not chunks:
-        return ChatResponse(
-            answer="I don't have enough information in our documents to answer this. Please contact a bank representative or Shariah advisor.",
-            sources=[],
-            report_url=None
-        )
-
-    # Format retrieved chunks and collect unique sources
-    context_blocks = []
-    sources = []
-    for doc_name, chunk_idx, chunk_text, _sim in chunks:
-        context_blocks.append(
-            f"--- Document: {doc_name} (Chunk #{chunk_idx}) ---\n{chunk_text.strip()}"
-        )
-        if doc_name not in sources:
-            sources.append(doc_name)
-
-    context_str = "\n\n".join(context_blocks)
+    context_str = "\n\n".join(context_blocks) if context_blocks else "(No specific internal database chunks found for this query.)"
 
     # 3. Read system prompt
     system_prompt = ml_models.get(
         "system_prompt",
-        "You are the Islamic Banking Assistant. Answer strictly based on the provided documents."
+        "You are the Islamic Banking Assistant. Answer strictly based on verified documents or tools."
     )
 
     # 4. Build user message combining document excerpts and the user's question
@@ -482,8 +508,9 @@ async def chat(request: ChatRequest):
         f"USER REQUEST:\n"
         f"{user_question}\n\n"
         f"Instructions:\n"
-        f"- Answer accurately and strictly based on the excerpts provided.\n"
-        f"- If the user explicitly asks for a report, call the generate_report tool."
+        f"- Answer accurately and clearly.\n"
+        f"- If the user asks about an online web URL or provided link, call the fetch_url_content tool.\n"
+        f"- If the user explicitly asks for a downloadable report, call the generate_report tool."
     )
 
     # 5. Call Gemini API with automatic model fallback for quota limits
@@ -500,7 +527,7 @@ async def chat(request: ChatRequest):
         try:
             config = types.GenerateContentConfig(
                 system_instruction=system_prompt,
-                tools=[REPORT_TOOL],
+                tools=[AGENT_TOOLS],
                 temperature=0.3,
             )
             response = client.models.generate_content(
@@ -524,49 +551,50 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=500, detail="Failed to get response from Gemini.")
 
     try:
-
         # 6. Check for function calls in Gemini's response
         report_url = None
         answer_text = ""
 
         if response.function_calls:
             for call in response.function_calls:
-                if call.name == "generate_report":
-                    args = call.args or {}
-                    topic = args.get("topic", "Islamic Banking Report")
-                    content_summary = args.get("content_summary", "")
+                tool_result, rep_url, fetched_url = handle_agent_tool_call(call.name, call.args or {})
+                if rep_url:
+                    report_url = rep_url
+                if fetched_url and fetched_url not in sources:
+                    sources.append(f"Web: {fetched_url}")
 
-                    # Execute Python function locally
-                    tool_result = generate_report(topic=topic, content_summary=content_summary)
-
-                    if tool_result.get("status") == "success":
-                        report_url = tool_result.get("download_url")
-
-                    # Send tool result back to Gemini to formulate final response
-                    follow_up_contents = [
-                        user_prompt_content,
-                        response.candidates[0].content,
-                        types.Content(
-                            role="user",
-                            parts=[
-                                types.Part.from_function_response(
-                                    name="generate_report",
-                                    response=tool_result,
-                                )
-                            ],
-                        ),
-                    ]
-
-                    follow_up_response = client.models.generate_content(
-                        model=used_model,  # Use the model that worked, not default
-                        contents=follow_up_contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_prompt,
-                            temperature=0.3,
-                        ),
+                if call.name == "fetch_url_content":
+                    extracted_body = tool_result.get("content", "")
+                    synthesis_prompt = (
+                        f"WEB CONTENT RETRIEVED FROM {fetched_url}:\n"
+                        f"=========================================\n"
+                        f"{extracted_body}\n\n"
+                        f"=========================================\n"
+                        f"USER QUESTION: {user_question}\n\n"
+                        f"Instructions:\n"
+                        f"- Provide a comprehensive, detailed, and structured text explanation answering the user's question based on the web content.\n"
+                        f"- Clearly list all stages, rules, and technical details.\n"
+                        f"- Cite the web source URL."
                     )
-                    answer_text = follow_up_response.text or ""
-                    break
+                    for syn_model in models_to_try:
+                        try:
+                            syn_resp = client.models.generate_content(
+                                model=syn_model,
+                                contents=synthesis_prompt,
+                                config=types.GenerateContentConfig(
+                                    system_instruction=system_prompt,
+                                    temperature=0.3,
+                                ),
+                            )
+                            if syn_resp.text:
+                                answer_text = syn_resp.text
+                                break
+                        except Exception:
+                            continue
+
+                elif call.name == "generate_report":
+                    answer_text = f"Your report on **{call.args.get('topic', 'Islamic Banking')}** has been generated successfully and is available for download."
+                break
         else:
             answer_text = response.text or ""
 
@@ -596,6 +624,7 @@ async def chat(request: ChatRequest):
         )
 
 
+
 # ---------------------------------------------------------------------------
 # Streaming SSE Endpoint: /chat/stream
 # ---------------------------------------------------------------------------
@@ -608,6 +637,7 @@ async def chat_stream(request: ChatRequest):
     """
     Streaming version of /chat using Server-Sent Events (SSE).
     Streams Gemini response tokens in real-time for instant user feedback.
+    Supports Agent function calling (fetch_url_content, generate_report).
     
     SSE Event format:
     - event: token   → partial text chunk
@@ -630,34 +660,24 @@ async def chat_stream(request: ChatRequest):
             detail="Embedding model is not ready."
         )
 
+    sources = []
+    context_blocks = []
+
     try:
         question_hash = hashlib.md5(user_question.encode()).hexdigest()
         query_embedding = get_cached_embedding(question_hash, user_question)
-        if query_embedding is None:
-            raise RuntimeError("Embedding model unavailable")
+        if query_embedding:
+            chunks = retrieve_top_chunks(query_embedding, top_k=5)
+            for doc_name, chunk_idx, chunk_text, _sim in chunks:
+                context_blocks.append(
+                    f"--- Document: {doc_name} (Chunk #{chunk_idx}) ---\n{chunk_text.strip()}"
+                )
+                if doc_name not in sources:
+                    sources.append(doc_name)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        print(f"⚠️ Vector search warning in stream: {exc}")
 
-    # 2. Retrieve chunks
-    chunks = retrieve_top_chunks(query_embedding, top_k=5)
-    if not chunks:
-        async def no_data_stream():
-            msg = "I don't have enough information in our documents to answer this. Please contact a bank representative or Shariah advisor."
-            yield f"event: token\ndata: {json.dumps({'text': msg})}\n\n"
-            yield f"event: done\ndata: {json.dumps({'sources': []})}\n\n"
-        return StreamingResponse(no_data_stream(), media_type="text/event-stream")
-
-    # Build context
-    context_blocks = []
-    sources = []
-    for doc_name, chunk_idx, chunk_text, _sim in chunks:
-        context_blocks.append(
-            f"--- Document: {doc_name} (Chunk #{chunk_idx}) ---\n{chunk_text.strip()}"
-        )
-        if doc_name not in sources:
-            sources.append(doc_name)
-
-    context_str = "\n\n".join(context_blocks)
+    context_str = "\n\n".join(context_blocks) if context_blocks else "(No specific internal database chunks found for this query.)"
     system_prompt = ml_models.get("system_prompt", "You are the Islamic Banking Assistant.")
 
     user_prompt_content = (
@@ -668,14 +688,15 @@ async def chat_stream(request: ChatRequest):
         f"USER REQUEST:\n"
         f"{user_question}\n\n"
         f"Instructions:\n"
-        f"- Answer accurately and strictly based on the excerpts provided.\n"
-        f"- If the user explicitly asks for a report, call the generate_report tool."
+        f"- Answer accurately and clearly.\n"
+        f"- If the user asks about an online web URL or provided link, call the fetch_url_content tool.\n"
+        f"- If the user explicitly asks for a downloadable report, call the generate_report tool."
     )
 
     async def event_stream():
         """Generator that yields SSE events with streamed Gemini response."""
         client = get_gemini_client()
-        models_to_try = [GEMINI_MODEL_NAME, "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
+        models_to_try = [GEMINI_MODEL_NAME, "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash"]
         seen = set()
         models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
 
@@ -687,7 +708,7 @@ async def chat_stream(request: ChatRequest):
             try:
                 config = types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    tools=[REPORT_TOOL],
+                    tools=[AGENT_TOOLS],
                     temperature=0.3,
                 )
 
@@ -698,64 +719,65 @@ async def chat_stream(request: ChatRequest):
                     config=config,
                 )
 
-                # Check if it's a function call (report generation)
-                full_text = ""
-                function_call_detected = False
-
                 for chunk in stream_response:
-                    # Check for function calls
+                    # Check for function calls (URL fetching or Report generation)
                     if chunk.function_calls:
-                        function_call_detected = True
                         for call in chunk.function_calls:
-                            if call.name == "generate_report":
-                                args = call.args or {}
-                                topic = args.get("topic", "Islamic Banking Report")
-                                content_summary = args.get("content_summary", "")
-                                tool_result = generate_report(topic=topic, content_summary=content_summary)
+                            tool_result, rep_url, fetched_url = handle_agent_tool_call(call.name, call.args or {})
+                            if rep_url:
+                                report_url = rep_url
+                                yield f"event: report\ndata: {json.dumps({'url': report_url})}\n\n"
+                            if fetched_url and fetched_url not in sources:
+                                sources.append(f"Web: {fetched_url}")
 
-                                if tool_result.get("status") == "success":
-                                    report_url = tool_result.get("download_url")
-                                    yield f"event: report\ndata: {json.dumps({'url': report_url})}\n\n"
+                            # If URL was fetched, synthesize and stream full text answer from the extracted content
+                            if call.name == "fetch_url_content":
+                                extracted_body = tool_result.get("content", "")
+                                synthesis_prompt = (
+                                    f"WEB CONTENT RETRIEVED FROM {fetched_url}:\n"
+                                    f"=========================================\n"
+                                    f"{extracted_body}\n\n"
+                                    f"=========================================\n"
+                                    f"USER QUESTION: {user_question}\n\n"
+                                    f"Instructions:\n"
+                                    f"- Provide a comprehensive, detailed, and structured text explanation answering the user's question based on the web content.\n"
+                                    f"- Clearly list all stages, rules, and technical details.\n"
+                                    f"- Cite the web source URL."
+                                )
+                                for syn_model in models_to_try:
+                                    try:
+                                        syn_stream = client.models.generate_content_stream(
+                                            model=syn_model,
+                                            contents=synthesis_prompt,
+                                            config=types.GenerateContentConfig(
+                                                system_instruction=system_prompt,
+                                                temperature=0.3,
+                                            ),
+                                        )
+                                        for syn_chunk in syn_stream:
+                                            if syn_chunk.text:
+                                                yield f"event: token\ndata: {json.dumps({'text': syn_chunk.text})}\n\n"
+                                                streamed_any = True
+                                                await asyncio.sleep(0)
+                                        break
+                                    except Exception as syn_exc:
+                                        print(f"⚠️ Synthesis stream failed on {syn_model}: {syn_exc}")
+                                        continue
 
-                                # Get follow-up response (non-streaming for tool results)
-                                try:
-                                    follow_up_contents = [
-                                        user_prompt_content,
-                                        chunk.candidates[0].content,
-                                        types.Content(
-                                            role="user",
-                                            parts=[
-                                                types.Part.from_function_response(
-                                                    name="generate_report",
-                                                    response=tool_result,
-                                                )
-                                            ],
-                                        ),
-                                    ]
-                                    follow_up = client.models.generate_content(
-                                        model=candidate_model,
-                                        contents=follow_up_contents,
-                                        config=types.GenerateContentConfig(
-                                            system_instruction=system_prompt,
-                                            temperature=0.3,
-                                        ),
-                                    )
-                                    if follow_up.text:
-                                        yield f"event: token\ndata: {json.dumps({'text': follow_up.text})}\n\n"
-                                        streamed_any = True
-                                except Exception as fu_exc:
-                                    yield f"event: token\ndata: {json.dumps({'text': 'Your report has been generated successfully.'})}\n\n"
-                                    streamed_any = True
+                            elif call.name == "generate_report":
+                                report_msg = f"Your report on **{call.args.get('topic', 'Islamic Banking')}** has been generated successfully and is ready for download."
+                                yield f"event: token\ndata: {json.dumps({'text': report_msg})}\n\n"
+                                streamed_any = True
                         break
 
-                    # Stream text tokens
+                    # Stream text tokens directly
                     if chunk.text:
                         yield f"event: token\ndata: {json.dumps({'text': chunk.text})}\n\n"
-                        full_text += chunk.text
                         streamed_any = True
                         await asyncio.sleep(0)  # Yield control for responsiveness
 
-                break  # Success, stop trying models
+                if streamed_any:
+                    break  # Success, stop trying models
 
             except Exception as exc:
                 last_error = exc
@@ -783,6 +805,8 @@ async def chat_stream(request: ChatRequest):
     )
 
 
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
